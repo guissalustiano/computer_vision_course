@@ -3,6 +3,7 @@ import cv2 as cv
 import scipy
 import skimage
 from math import ceil
+import matplotlib.pyplot as plt
 
 
 cap = cv.VideoCapture("original.mp4")
@@ -46,9 +47,9 @@ def between(cap, lower: int, upper: int) -> bool:
     return lower <= int(cap.get(cv.CAP_PROP_POS_MSEC)) < upper
 
 def write_text(frame, text: str):
-    cv.putText(frame, text, (10, 30), cv.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2, cv.LINE_AA)
+    cv.putText(frame, text, (10, 30), cv.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv.LINE_AA)
 
-
+old_gray = None
 while cap.isOpened():
     ret, frame = cap.read()
     
@@ -57,6 +58,9 @@ while cap.isOpened():
             break
 
         timestamp = int(cap.get(cv.CAP_PROP_POS_MSEC))//1000
+        if timestamp < 79:
+            continue
+
         if timestamp < 5:
             pass
             write_text(frame, "Original")
@@ -179,11 +183,12 @@ while cap.isOpened():
 
             mask = np.zeros(frame.shape, dtype=np.bool_)
             height, width = frame.shape
-            circle_mask[:,(width//45):(2*width//5)] = True
-            circle_mask[:,:,-1] |= circle_mask
+            mask[:,(width//5):(2*width//5)] = True
+            mask |= mask[::,::-1]
 
-            frame_fft[circle_mask] = 0
-            frame_magnitude[circle_mask] = 0
+
+            frame_fft[mask] = 0
+            frame_magnitude[mask] = 0
 
             if timestamp < 65:
                 frame = frame_magnitude
@@ -193,18 +198,85 @@ while cap.isOpened():
             frame = cv.cvtColor(frame.astype(np.float32), cv.COLOR_GRAY2RGB)
             frame = cv.normalize(frame, None, 255, 0, cv.NORM_MINMAX, cv.CV_8U)
 
-            if timestamp < 50:
+            if timestamp < 65:
                 write_text(frame, "FFT high pass filter log magnitude")
             else:
                 write_text(frame, "FFT high pass filter spatial domain")
-        
-        
+
+        elif timestamp < 75:
+            # Template matching
+            template = cv.imread("template.png", cv.IMREAD_GRAYSCALE)
+            frame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            frame = cv.matchTemplate(frame, template, cv.TM_CCOEFF_NORMED)
+
+
+            frame = cv.cvtColor(frame.astype(np.float32), cv.COLOR_GRAY2RGB)
+            frame = cv.normalize(frame, None, 255, 0, cv.NORM_MINMAX, cv.CV_8U)
+
+            height,width = template.shape
+            template = cv.cvtColor(template.astype(np.float32), cv.COLOR_GRAY2RGB)
+            frame[:height, -width:] = template
+
+            write_text(frame, "Template matching")
+        elif timestamp < 80:
+            template = cv.imread('template.png', cv.IMREAD_GRAYSCALE)
+            frame_gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            height,width = template.shape
+            res = cv.matchTemplate(frame_gray,template,cv.TM_CCOEFF_NORMED)
+            threshold = 0.5
+            loc = np.where( res >= threshold)
+            for pt in zip(*loc[::-1]):
+                cv.rectangle(frame, pt, (pt[0] + width, pt[1] + height), (0,0,255), 2)
+
+            template = cv.cvtColor(template.astype(np.float32), cv.COLOR_GRAY2RGB)
+            frame[:height, -width:] = template
+            write_text(frame, "Template matching rectangles")
+        elif timestamp < 90:
+            # Optical flow
+            if old_gray is None:
+                # flow parameters
+                feature_params = dict( maxCorners = 500,
+                 qualityLevel = 0.5,
+                 minDistance = 20,
+                 blockSize = 7 )
+
+                # Parameters for lucas kanade optical flow
+                lk_params = dict( winSize = (15, 15),
+                 maxLevel = 2,
+                 criteria = (cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 10, 0.03))
+
+                # Create some random colors
+            color = (0, 255, 0)
+
+            old_gray = cv.cvtColor(old_frame, cv.COLOR_BGR2GRAY)
+            p0 = cv.goodFeaturesToTrack(old_gray, mask = None, **feature_params)
+            frame_gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+ 
+            # Calculate Optical Flow
+            p1, st, err = cv.calcOpticalFlowPyrLK(
+                old_gray, frame_gray, p0, None, **lk_params
+            )
+            # Select good points
+            if p1 is not None:
+                good_new = p1[st == 1]
+                good_old = p0[st == 1]
+         
+            # Draw the tracks
+            for i, (new, old) in enumerate(zip(good_new, good_old)):
+                a, b = new.ravel()
+                c, d = old.ravel()
+                a, b, c, d = int(a), int(b), int(c), int(d)
+                frame = cv.arrowedLine(frame, (a, b), (c, d), color, 2)
+         
+            # Update the previous frame and previous points
+            old_gray = frame_gray.copy()
+            p0 = good_new.reshape(-1, 1, 2)
         else:
             break
 
 
         out.write(frame)
-        #cv.imshow('Frame', frame)
+        cv.imshow('Frame', frame)
 
         # Press Q on keyboard to  exit
         # if cv.waitKey(25) & 0xFF == ord('q'):
@@ -212,6 +284,8 @@ while cap.isOpened():
 
     else:
         break
+    
+    old_frame = frame
 
 # When everything done, release the video capture and writing object
 cap.release()

@@ -3,16 +3,10 @@ import cv2 as cv
 import scipy
 import skimage
 from math import ceil
+import tensorflow as tf
 import matplotlib.pyplot as plt
+from PIL import Image
 
-
-cap = cv.VideoCapture("original.mp4")
-fps = int(round(cap.get(5)))
-frame_width = int(cap.get(3))
-frame_height = int(cap.get(4))
-
-fourcc = cv.VideoWriter_fourcc(*'mp4v')
-out = cv.VideoWriter("output.mp4", fourcc, fps, (frame_width, frame_height))
 
 # from https://stackoverflow.com/a/46892763
 def gkern(sigma=5, kernlen=None):
@@ -49,6 +43,91 @@ def between(cap, lower: int, upper: int) -> bool:
 def write_text(frame, text: str):
     cv.putText(frame, text, (10, 30), cv.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv.LINE_AA)
 
+## Style transfer functions (based in https://www.kaggle.com/code/scratchpad/notebooka00d56c892)
+# Load the images
+# Function to load an image from a file, and add a batch dimension.
+def load_img_opencv(source):
+    if isinstance(source, str):
+        img = cv.imread(source)
+    else:
+        img = source
+    img = np.float32(img)/255.0
+    img = cv.cvtColor(img, cv.COLOR_BGR2RGB)
+    img = tf.convert_to_tensor(img)
+    img = img[tf.newaxis, :]
+    return img
+
+# Function to pre-process by resizing an central cropping it.
+def preprocess_image(image, target_dim):
+  # Resize the image so that the shorter dimension becomes 256px.
+  shape = tf.cast(tf.shape(image)[1:-1], tf.float32)
+  short_dim = min(shape)
+  scale = target_dim / short_dim
+  new_shape = tf.cast(shape * scale, tf.int32)
+  image = tf.image.resize(image, new_shape)
+
+  # Central crop the image.
+  image = tf.image.resize_with_crop_or_pad(image, target_dim, target_dim)
+
+  return image
+
+def run_style_predict(style_image):
+  # Load the model.
+  interpreter = tf.lite.Interpreter(model_path='predict.tflite')
+
+  preprocessed_style_image = preprocess_image(style_image, 256)
+  # Set model input.
+  interpreter.allocate_tensors()
+  input_details = interpreter.get_input_details()
+  interpreter.set_tensor(input_details[0]["index"], preprocessed_style_image)
+
+  # Calculate style bottleneck.
+  interpreter.invoke()
+  style_bottleneck = interpreter.tensor(
+      interpreter.get_output_details()[0]["index"]
+      )()
+
+  return style_bottleneck
+
+
+# Run style transform on preprocessed style image
+def run_style_transform(style_bottleneck, content_image, content_image_size=512):
+  # Load the model.
+  interpreter = tf.lite.Interpreter(model_path='transfer.tflite')
+
+  preprocessed_content_image = preprocess_image(content_image, content_image_size)
+
+  # Set model input.
+  input_details = interpreter.get_input_details()
+  for index in range(len(input_details)):
+    if input_details[index]["name"]=='content_image':
+      index = input_details[index]["index"]
+      interpreter.resize_tensor_input(index, [1, content_image_size, content_image_size, 3])
+  interpreter.allocate_tensors()
+
+  # Set model inputs.
+  for index in range(len(input_details)):
+    if input_details[index]["name"]=='Conv/BiasAdd':
+      interpreter.set_tensor(input_details[index]["index"], style_bottleneck)
+    elif input_details[index]["name"]=='content_image':
+      interpreter.set_tensor(input_details[index]["index"], preprocessed_content_image)
+  interpreter.invoke()
+
+  # Transform content image.
+  stylized_image = interpreter.tensor(
+      interpreter.get_output_details()[0]["index"]
+      )()
+
+  return tf.image.resize(stylized_image[0], content_image[0].shape[:-1], antialias=True)
+style_bottleneck = run_style_predict(load_img_opencv("./style.png"))
+
+cap = cv.VideoCapture("original.mp4")
+fps = int(round(cap.get(5)))
+frame_width = int(cap.get(3))
+frame_height = int(cap.get(4))
+
+fourcc = cv.VideoWriter_fourcc(*'mp4v')
+out = cv.VideoWriter("output.mp4", fourcc, fps, (frame_width, frame_height))
 old_gray = None
 while cap.isOpened():
     ret, frame = cap.read()
@@ -58,9 +137,6 @@ while cap.isOpened():
             break
 
         timestamp = int(cap.get(cv.CAP_PROP_POS_MSEC))//1000
-        if timestamp < 79:
-            continue
-
         if timestamp < 5:
             pass
             write_text(frame, "Original")
@@ -219,6 +295,7 @@ while cap.isOpened():
 
             write_text(frame, "Template matching")
         elif timestamp < 80:
+            # Show template matching
             template = cv.imread('template.png', cv.IMREAD_GRAYSCALE)
             frame_gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
             height,width = template.shape
@@ -271,12 +348,21 @@ while cap.isOpened():
             # Update the previous frame and previous points
             old_gray = frame_gray.copy()
             p0 = good_new.reshape(-1, 1, 2)
+
+            write_text(frame, "Optical flow")
+        elif timestamp < 130:
+            cv.imwrite("./temp.png", frame)
+            content_image = load_img_opencv("./temp.png")
+            stylized_image = run_style_transform(style_bottleneck, content_image).numpy()
+
+            frame = cv.cvtColor(stylized_image, cv.COLOR_RGB2BGR)
+            frame = cv.normalize(frame, None, 255, 0, cv.NORM_MINMAX, cv.CV_8U)
+
+            write_text(frame, "Style transfer")
         else:
             break
 
-
         out.write(frame)
-        cv.imshow('Frame', frame)
 
         # Press Q on keyboard to  exit
         # if cv.waitKey(25) & 0xFF == ord('q'):
